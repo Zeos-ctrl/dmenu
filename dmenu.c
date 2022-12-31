@@ -17,6 +17,8 @@
 #endif
 #include <X11/Xft/Xft.h>
 
+static int fuzzy = 1;                      /* -F  option; if 0, dmenu doesn't use fuzzy matching     */
+
 #include "drw.h"
 #include "util.h"
 
@@ -25,23 +27,19 @@
                              * MAX(0, MIN((y)+(h),(r).y_org+(r).height) - MAX((y),(r).y_org)))
 #define LENGTH(X)             (sizeof X / sizeof X[0])
 #define TEXTW(X)              (drw_fontset_getwidth(drw, (X)) + lrpad)
-#define NUMBERSMAXDIGITS      100
-#define NUMBERSBUFSIZE        (NUMBERSMAXDIGITS * 2) + 1
 
 /* enums */
-enum { SchemeNorm, SchemeSel, SchemeOut, SchemeHp, SchemeNormHighlight, 
-SchemeSelHighlight, SchemeOutHighlight, SchemeLast };
+enum { SchemeNorm, SchemeSel, SchemeNormHighlight, SchemeSelHighlight,
+       SchemeOut, SchemeLast }; /* color schemes */
+
 
 struct item {
 	char *text;
 	struct item *left, *right;
-	int out, hp;
+	int out;
 	double distance;
 };
 
-static char **hpitems = NULL;
-static int hplength = 0;
-static char numbers[NUMBERSBUFSIZE] = "";
 static char text[BUFSIZ] = "";
 static char *embed;
 static int bh, mw, mh;
@@ -63,51 +61,14 @@ static Clr *scheme[SchemeLast];
 
 #include "config.h"
 
-static char * cistrstr(const char *s, const char *sub);
-static int (*fstrncmp)(const char *, const char *, size_t) = strncasecmp;
-static char *(*fstrstr)(const char *, const char *) = cistrstr;
+static int (*fstrncmp)(const char *, const char *, size_t) = strncmp;
+static char *(*fstrstr)(const char *, const char *) = strstr;
 
 static unsigned int
 textw_clamp(const char *str, unsigned int n)
 {
 	unsigned int w = drw_fontset_getwidth_clamp(drw, str, n) + lrpad;
 	return MIN(w, n);
-}
-
-static char **
-tokenize(char *source, const char *delim, int *llen)
-{
-	int listlength = 0, list_size = 0;
-	char **list = NULL, *token;
-
-	token = strtok(source, delim);
-	while (token) {
-		if (listlength + 1 >= list_size) {
-			if (!(list = realloc(list, (list_size += 8) * sizeof(*list))))
-				die("Unable to realloc %zu bytes\n", list_size * sizeof(*list));
-		}
-		if (!(list[listlength] = strdup(token)))
-			die("Unable to strdup %zu bytes\n", strlen(token) + 1);
-		token = strtok(NULL, delim);
-		listlength++;
-	}
-
-	*llen = listlength;
-	return list;
-}
-
-static int
-arrayhas(char **list, int length, char *item)
-{
-	int i;
-
-	for (i = 0; i < length; i++) {
-		size_t len1 = strlen(list[i]);
-		size_t len2 = strlen(item);
-		if (!fstrncmp(list[i], item, len1 > len2 ? len2 : len1))
-			return 1;
-	}
-	return 0;
 }
 
 static void
@@ -131,7 +92,7 @@ calcoffsets(void)
 	if (lines > 0)
 		n = lines * bh;
 	else
-		n = mw - (promptw + inputw + TEXTW("<") + TEXTW(">") + TEXTW(numbers));
+		n = mw - (promptw + inputw + TEXTW("<") + TEXTW(">"));
 	/* calculate which items will begin the next page and previous page */
 	for (i = 0, next = curr; next; next = next->right)
 		if ((i += (lines > 0) ? bh : textw_clamp(next->text, n)) > n)
@@ -149,9 +110,6 @@ cleanup(void)
 	XUngrabKey(dpy, AnyKey, AnyModifier, root);
 	for (i = 0; i < SchemeLast; i++)
 		free(scheme[i]);
-	for (i = 0; i < hplength; ++i)
-		free(hpitems[i]);
-	free(hpitems);
 	for (i = 0; items && items[i].text; ++i)
 		free(items[i].text);
 	free(items);
@@ -177,7 +135,7 @@ cistrstr(const char *h, const char *n)
 	}
 	return NULL;
 }
-/*
+
 static void
 drawhighlights(struct item *item, int x, int y, int maxw)
 {
@@ -192,14 +150,14 @@ drawhighlights(struct item *item, int x, int y, int maxw)
 	                   ? SchemeSelHighlight
 	                   : SchemeNormHighlight]);
 	for (i = 0, highlight = item->text; *highlight && text[i];) {
-		if (*highlight == text[i]) {
-			get indentation
+        if (!fstrncmp(&(*highlight), &text[i], 1)) {
+			/* get indentation */
 			c = *highlight;
 			*highlight = '\0';
 			indent = TEXTW(item->text);
 			*highlight = c;
 
-			highlight character
+			/* highlight character */
 			c = highlight[1];
 			highlight[1] = '\0';
 			drw_text(
@@ -215,44 +173,7 @@ drawhighlights(struct item *item, int x, int y, int maxw)
 		highlight++;
 	}
 }
-*/
 
-static void
-drawhighlights(struct item *item, int x, int y, int maxw)
-{
-	char restorechar, tokens[sizeof text], *highlight,  *token;
-	int indentx, highlightlen;
-
-	drw_setscheme(drw, scheme[item == sel ? SchemeSelHighlight : item->out ? SchemeOutHighlight : SchemeNormHighlight]);
-	strcpy(tokens, text);
-	for (token = strtok(tokens, " "); token; token = strtok(NULL, " ")) {
-		highlight = fstrstr(item->text, token);
-		while (highlight) {
-			// Move item str end, calc width for highlight indent, & restore
-			highlightlen = highlight - item->text;
-			restorechar = *highlight;
-			item->text[highlightlen] = '\0';
-			indentx = TEXTW(item->text);
-			item->text[highlightlen] = restorechar;
-
-			// Move highlight str end, draw highlight, & restore
-			restorechar = highlight[strlen(token)];
-			highlight[strlen(token)] = '\0';
-			if (indentx - (lrpad / 2) - 1 < maxw)
-				drw_text(
-					drw,
-					x + indentx - (lrpad / 2) - 1,
-					y,
-					MIN(maxw - indentx, TEXTW(highlight) - lrpad),
-					bh, 0, highlight, 0
-				);
-			highlight[strlen(token)] = restorechar;
-
-			if (strlen(highlight) - strlen(token) < strlen(token)) break;
-			highlight = fstrstr(highlight + strlen(token), token);
-		}
-	}
-}
 
 static int
 drawitem(struct item *item, int x, int y, int w)
@@ -260,31 +181,14 @@ drawitem(struct item *item, int x, int y, int w)
 	int r;
 	if (item == sel)
 		drw_setscheme(drw, scheme[SchemeSel]);
-	else if (item->hp)
-		drw_setscheme(drw, scheme[SchemeHp]);
 	else if (item->out)
 		drw_setscheme(drw, scheme[SchemeOut]);
 	else
 		drw_setscheme(drw, scheme[SchemeNorm]);
+
 	r = drw_text(drw, x, y, w, bh, lrpad / 2, item->text, 0);
 	drawhighlights(item, x, y, w);
 	return r;
-
-}
-
-static void
-recalculatenumbers()
-{
-	unsigned int numer = 0, denom = 0;
-	struct item *item;
-	if (matchend) {
-		numer++;
-		for (item = matchend; item && item->left; item = item->left)
-			numer++;
-	}
-	for (item = items; item && item->text; item++)
-		denom++;
-	snprintf(numbers, NUMBERSBUFSIZE, "%d/%d", numer, denom);
 }
 
 static void
@@ -292,7 +196,7 @@ drawmenu(void)
 {
 	unsigned int curpos;
 	struct item *item;
-	int x = 0, y = 0, fh = drw->fonts->h, w;
+	int x = 0, y = 0, w;
 
 	drw_setscheme(drw, scheme[SchemeNorm]);
 	drw_rect(drw, 0, 0, mw, mh, 1, 1);
@@ -309,10 +213,9 @@ drawmenu(void)
 	curpos = TEXTW(text) - TEXTW(&text[cursor]);
 	if ((curpos += lrpad / 2 - 1) < w) {
 		drw_setscheme(drw, scheme[SchemeNorm]);
-		drw_rect(drw, x + curpos, 2 + (bh - fh) / 2, 2, fh - 4, 1, 0);
+		drw_rect(drw, x + curpos, 2, 2, bh - 4, 1, 0);
 	}
 
-	recalculatenumbers();
 	if (lines > 0) {
 		/* draw vertical list */
 		for (item = curr; item != next; item = item->right)
@@ -327,15 +230,13 @@ drawmenu(void)
 		}
 		x += w;
 		for (item = curr; item != next; item = item->right)
-			x = drawitem(item, x, 0, textw_clamp(item->text, mw - x - TEXTW(">") - TEXTW(numbers)));
+			x = drawitem(item, x, 0, textw_clamp(item->text, mw - x - TEXTW(">")));
 		if (next) {
 			w = TEXTW(">");
 			drw_setscheme(drw, scheme[SchemeNorm]);
-			drw_text(drw, mw - w - TEXTW(numbers), 0, w, bh, lrpad / 2, ">", 0);
+			drw_text(drw, mw - w, 0, w, bh, lrpad / 2, ">", 0);
 		}
 	}
-	drw_setscheme(drw, scheme[SchemeNorm]);
-	drw_text(drw, mw - TEXTW(numbers), 0, TEXTW(numbers), bh, lrpad / 2, numbers, 0);
 	drw_map(drw, win, 0, 0, mw, mh);
 }
 
@@ -393,7 +294,7 @@ fuzzymatch(void)
 {
 	/* bang - we have so much memory */
 	struct item *it;
-    struct item **fuzzymatches = NULL;
+	struct item **fuzzymatches = NULL;
 	char c;
 	int number_of_matches = 0, i, pidx, sidx, eidx;
 	int text_len = strlen(text), itext_len;
@@ -417,7 +318,7 @@ fuzzymatch(void)
 						eidx = i;
 						break;
 					}
-			}
+				}
 			}
 			/* build list of matches */
 			if (eidx != -1) {
@@ -455,26 +356,6 @@ fuzzymatch(void)
 	calcoffsets();
 }
 
-static void readstdin(FILE* stream);
-
-static void
-refreshoptions(){
-	int dynlen = strlen(dynamic);
-	char* cmd= malloc(dynlen + strlen(text)+2);
-	if(cmd == NULL)
-		die("malloc:");
-	sprintf(cmd,"%s %s",dynamic, text);
-	FILE *stream = popen(cmd, "r");
-	if(!stream)
-		die("popen(%s):",cmd);
-	readstdin(stream);
-	int pc = pclose(stream);
-	if(pc == -1)
-		die("pclose:");
-	free(cmd);
-	curr = sel = items;
-}
-
 static void
 match(void)
 {
@@ -482,17 +363,13 @@ match(void)
 		fuzzymatch();
 		return;
 	}
-	if(dynamic && *dynamic){
-		refreshoptions();
-	}
-
 	static char **tokv = NULL;
 	static int tokn = 0;
 
 	char buf[sizeof text], *s;
 	int i, tokc = 0;
 	size_t len, textsize;
-	struct item *item, *lhpprefix, *lprefix, *lsubstr, *hpprefixend, *prefixend, *substrend;
+	struct item *item, *lprefix, *lsubstr, *prefixend, *substrend;
 
 	strcpy(buf, text);
 	/* separate input text into tokens to be matched individually */
@@ -501,36 +378,21 @@ match(void)
 			die("cannot realloc %zu bytes:", tokn * sizeof *tokv);
 	len = tokc ? strlen(tokv[0]) : 0;
 
-	if (use_prefix) {
-		matches = lprefix = matchend = prefixend = NULL;
-		textsize = strlen(text);
-	} else {
-		matches = lprefix = lsubstr = matchend = prefixend = substrend = NULL;
-		textsize = strlen(text) + 1;
-    }
+	matches = lprefix = lsubstr = matchend = prefixend = substrend = NULL;
+	textsize = strlen(text) + 1;
 	for (item = items; item && item->text; item++) {
 		for (i = 0; i < tokc; i++)
 			if (!fstrstr(item->text, tokv[i]))
 				break;
-		if (i != tokc && !(dynamic && *dynamic)) /* not all tokens match */
+		if (i != tokc) /* not all tokens match */
 			continue;
-		/* exact matches go first, then prefixes with high priority, then prefixes, then substrings */
+		/* exact matches go first, then prefixes, then substrings */
 		if (!tokc || !fstrncmp(text, item->text, textsize))
 			appenditem(item, &matches, &matchend);
-		else if (item->hp && !fstrncmp(tokv[0], item->text, len))
-			appenditem(item, &lhpprefix, &hpprefixend);
 		else if (!fstrncmp(tokv[0], item->text, len))
 			appenditem(item, &lprefix, &prefixend);
-		else if (!use_prefix)
+		else
 			appenditem(item, &lsubstr, &substrend);
-	}
-	if (lhpprefix) {
-		if (matches) {
-			matchend->right = lhpprefix;
-			lhpprefix->left = matchend;
-		} else
-			matches = lhpprefix;
-		matchend = hpprefixend;
 	}
 	if (lprefix) {
 		if (matches) {
@@ -540,7 +402,7 @@ match(void)
 			matches = lprefix;
 		matchend = prefixend;
 	}
-	if (!use_prefix && lsubstr) {
+	if (lsubstr) {
 		if (matches) {
 			matchend->right = lsubstr;
 			lsubstr->left = matchend;
@@ -548,7 +410,6 @@ match(void)
 			matches = lsubstr;
 		matchend = substrend;
 	}
-
 	curr = sel = matches;
 	calcoffsets();
 }
@@ -598,7 +459,6 @@ keypress(XKeyEvent *ev)
 {
 	char buf[32];
 	int len;
-	struct item * item;
 	KeySym ksym;
 	Status status;
 
@@ -788,18 +648,12 @@ insert:
 		}
 		break;
 	case XK_Tab:
-		if (!matches) break; /* cannot complete no matches */
-		strncpy(text, matches->text, sizeof text - 1);
+		if (!sel)
+			return;
+		cursor = strnlen(sel->text, sizeof text - 1);
 		memcpy(text, sel->text, cursor);
 		text[cursor] = '\0';
-		len = cursor = strlen(text); /* length of longest common prefix */
-		for (item = matches; item && item->text; item = item->right) {
-			cursor = 0;
-			while (cursor < len && text[cursor] == item->text[cursor])
-				cursor++;
-			len = cursor;
-		}
-		memset(text + len, '\0', strlen(text) - len);
+		match();
 		break;
 	}
 
@@ -826,15 +680,14 @@ paste(void)
 }
 
 static void
-readstdin(FILE* stream)
+readstdin(void)
 {
 	char *line = NULL;
 	size_t i, junk, size = 0;
 	ssize_t len;
-    char buf[sizeof text], *p;
 
 	/* read each line from stdin and add it to the item list */
-	for (i = 0; fgets(buf, sizeof buf, stream); i++) {
+	for (i = 0; (len = getline(&line, &junk, stdin)) != -1; i++, line = NULL) {
 		if (i + 1 >= size / sizeof *items)
 			if (!(items = realloc(items, (size += BUFSIZ))))
 				die("cannot realloc %zu bytes:", size);
@@ -842,12 +695,10 @@ readstdin(FILE* stream)
 			line[len - 1] = '\0';
 		items[i].text = line;
 		items[i].out = 0;
-		items[i].hp = arrayhas(hpitems, hplength, items[i].text);
 	}
 	if (items)
 		items[i].text = NULL;
-	if (!dynamic || !*dynamic)
-		lines = MIN(lines, i);
+	lines = MIN(lines, i);
 }
 
 static void
@@ -912,7 +763,6 @@ setup(void)
 
 	/* calculate menu geometry */
 	bh = drw->fonts->h + 2;
-	bh = MAX(bh,lineheight);	/* make a menu line AT LEAST 'lineheight' tall */
 	lines = MAX(lines, 0);
 	mh = (lines + 1) * bh;
 #ifdef XINERAMA
@@ -993,10 +843,9 @@ setup(void)
 static void
 usage(void)
 {
-	fputs("usage: dmenu [-bfivx] [-l lines] [-p prompt] [-fn font] [-m monitor]\n"
-	      "             [-nb color] [-nf color] [-sb color] [-sf color] [-w windowid]\n"
-	      "             [-nhb color] [-nhf color] [-shb color] [-shf color] [-w windowid]\n", stderr);
-    exit(1);
+	die("usage: dmenu [-bfiv] [-l lines] [-p prompt] [-fn font] [-m monitor]\n"
+        "             [-nb color] [-nf color] [-sb color] [-sf color]\n"
+        "             [-nhb color] [-nhf color] [-shb color] [-shf color] [-w windowid]\n", stderr);
 }
 
 int
@@ -1016,20 +865,14 @@ main(int argc, char *argv[])
 			fast = 1;
 		else if (!strcmp(argv[i], "-F"))   /* grabs keyboard before reading stdin */
 			fuzzy = 0;
-		else if (!strcmp(argv[i], "-s")) { /* case-sensitive item matching */
-			fstrncmp = strncmp;
-			fstrstr = strstr;
-		} else if (!strcmp(argv[i], "-x"))   /* invert use_prefix */
-			use_prefix = !use_prefix;
-		else if (i + 1 == argc)
+		else if (!strcmp(argv[i], "-i")) { /* case-insensitive item matching */
+			fstrncmp = strncasecmp;
+			fstrstr = cistrstr;
+		} else if (i + 1 == argc)
 			usage();
 		/* these options take one argument */
 		else if (!strcmp(argv[i], "-l"))   /* number of lines in vertical list */
 			lines = atoi(argv[++i]);
-		else if (!strcmp(argv[i], "-h")) { /* minimum height of one menu line */
-			lineheight = atoi(argv[++i]);
-			lineheight = MAX(lineheight, min_lineheight);
-		}
 		else if (!strcmp(argv[i], "-m"))
 			mon = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-p"))   /* adds prompt to left of input field */
@@ -1040,10 +883,6 @@ main(int argc, char *argv[])
 			colors[SchemeNorm][ColBg] = argv[++i];
 		else if (!strcmp(argv[i], "-nf"))  /* normal foreground color */
 			colors[SchemeNorm][ColFg] = argv[++i];
-		else if (!strcmp(argv[i], "-hb"))  /* high priority background color */
-			colors[SchemeHp][ColBg] = argv[++i];
-		else if (!strcmp(argv[i], "-hf")) /* low priority background color */
-			colors[SchemeHp][ColFg] = argv[++i];
 		else if (!strcmp(argv[i], "-sb"))  /* selected background color */
 			colors[SchemeSel][ColBg] = argv[++i];
 		else if (!strcmp(argv[i], "-sf"))  /* selected foreground color */
@@ -1058,10 +897,6 @@ main(int argc, char *argv[])
 			colors[SchemeSelHighlight][ColFg] = argv[++i];
 		else if (!strcmp(argv[i], "-w"))   /* embedding window id */
 			embed = argv[++i];
-		else if (!strcmp(argv[i], "-hp"))
-			hpitems = tokenize(argv[++i], ",", &hplength);
-		else if (!strcmp(argv[i], "-dy"))  /* dynamic command to run */
-			dynamic = argv[++i];
 		else
 			usage();
 
@@ -1088,11 +923,9 @@ main(int argc, char *argv[])
 
 	if (fast && !isatty(0)) {
 		grabkeyboard();
-		if(!(dynamic && *dynamic))
-			readstdin(stdin);
+		readstdin();
 	} else {
-		if(!(dynamic && *dynamic))
-			readstdin(stdin);
+		readstdin();
 		grabkeyboard();
 	}
 	setup();
